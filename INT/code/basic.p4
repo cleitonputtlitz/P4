@@ -2,7 +2,11 @@
 #include <core.p4>
 #include <v1model.p4>
 
+#define MAX_HOPS 10
+
 const bit<16> TYPE_IPV4 = 0x800;
+const bit<16> TYPE_INT_PAI = 0x1212;
+const bit<16> TYPE_INT_FILHO = 0x1213;
 
 /*************************************************************************
 *********************** H E A D E R S  ***********************************
@@ -33,13 +37,27 @@ header ipv4_t {
     ip4Addr_t dstAddr;
 }
 
+header int_pai_t {
+    bit<32> Qtd_Filhos;
+}
+
+header int_filho_t {
+    bit<32> swid;
+    bit<9>  Porta_Entrada;
+    bit<9>  Porta_Saida;
+    bit<48> Timestamp;
+    bit<6>  Padding;
+}
+
 struct metadata {
-    /* empty */
+    bit<32> Qtd_Filhos;
 }
 
 struct headers {
-    ethernet_t   ethernet;
-    ipv4_t       ipv4;
+    ethernet_t                ethernet;
+    ipv4_t                    ipv4;
+    int_pai_t                 int_pai;
+    int_filho_t[MAX_HOPS]     int_filho;
 }
 
 /*************************************************************************
@@ -58,8 +76,27 @@ parser MyParser(packet_in packet,
     state parse_ethernet {
         packet.extract(hdr.ethernet);
         transition select(hdr.ethernet.etherType) {
+            TYPE_INT_PAI: parse_int_pai;
             TYPE_IPV4: parse_ipv4;
             default: accept;
+        }
+    }
+
+    state parse_int_pai {
+        packet.extract(hdr.int_pai);
+        meta.Qtd_Filhos = hdr.int_pai.Qtd_Filhos;
+        transition select(hdr.int_pai.Qtd_Filhos) {
+            0: parse_ipv4;
+            default: parse_int_filho;
+        }
+    }
+
+    state parse_int_filho {
+        packet.extract(hdr.int_filho.next);
+        meta.Qtd_Filhos = meta.Qtd_Filhos -1;
+        transition select(meta.Qtd_Filhos) {
+            0: parse_ipv4;
+            default: parse_int_filho;
         }
     }
 
@@ -124,7 +161,45 @@ control MyIngress(inout headers hdr,
 control MyEgress(inout headers hdr,
                  inout metadata meta,
                  inout standard_metadata_t standard_metadata) {
-    apply {  }
+
+
+    action add_int_filho(bit<32> swid) {
+        hdr.int_filho.push_front(1);
+        hdr.int_filho[0].setValid();
+        hdr.int_filho[0].swid           = swid;
+        hdr.int_filho[0].Porta_Entrada  = standard_metadata.ingress_port;
+        hdr.int_filho[0].Porta_Saida    = standard_metadata.egress_port;
+        hdr.int_filho[0].Timestamp      = (bit <48>) standard_metadata.ingress_global_timestamp;
+        hdr.int_filho[0].Padding        = 0;
+
+    }
+
+    table int_filho {
+        actions = {
+            add_int_filho;
+            NoAction;
+        }
+        default_action = NoAction();
+    }
+
+    apply {
+
+        if(!hdr.int_pai.isValid()) {
+            hdr.int_pai.setValid();
+            hdr.int_pai.Qtd_Filhos = 0;
+        }
+
+        hdr.int_pai.Qtd_Filhos = hdr.int_pai.Qtd_Filhos + 1;
+
+        hdr.ethernet.etherType = TYPE_INT_PAI;
+
+        int_filho.apply();
+
+        if(hdr.int_pai.Qtd_Filhos == 1) {
+            hdr.int_filho[0].Padding = 1;
+        }
+
+    }
 }
 
 /*************************************************************************
@@ -158,6 +233,8 @@ control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
 control MyDeparser(packet_out packet, in headers hdr) {
     apply {
         packet.emit(hdr.ethernet);
+        packet.emit(hdr.int_pai);
+        packet.emit(hdr.int_filho);
         packet.emit(hdr.ipv4);
     }
 }
